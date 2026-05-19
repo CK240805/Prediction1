@@ -26,7 +26,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Train LSTM model
-        run: python toto_engine.py train --epochs 30
+        run: python toto_engine.py train --epochs 100
 
       - name: Commit and push new model weights
         run: |
