@@ -1,8 +1,9 @@
 """
-toto_engine.py – Unified core for Singapore TOTO scraper, analytics, and ML.
+toto_engine.py – Unified core for Singapore TOTO scraper, analytics, ML, and backfill.
 """
 import re
 import json
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -97,6 +98,28 @@ def update_csv():
     df = pd.concat([df, pd.DataFrame([new_draw])], ignore_index=True)
     df.to_csv(CSV_PATH, index=False)
     print(f"Added draw {new_draw['draw_no']}.")
+
+def backfill_draws(start_draw: int, end_draw: int):
+    """Fetch and append historical draws from start_draw to end_draw (inclusive)."""
+    df = load_data() if CSV_PATH.exists() else pd.DataFrame()
+    existing_draws = set(df["draw_no"]) if not df.empty else set()
+
+    for draw_no in range(start_draw, end_draw + 1):
+        if draw_no in existing_draws:
+            print(f"Draw {draw_no} already in CSV. Skipping.")
+            continue
+        try:
+            html = fetch_page(draw_no)
+            json_data = extract_draw_json(html)
+            row = parse_draw(json_data)
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            existing_draws.add(draw_no)
+            print(f"Added draw {draw_no}")
+        except Exception as e:
+            print(f"Failed to fetch draw {draw_no}: {e}")
+        time.sleep(1)  # be polite
+    df.to_csv(CSV_PATH, index=False)
+    print(f"Backfill complete. Total draws: {len(df)}")
 
 
 # ============================================
@@ -198,7 +221,6 @@ class TotoDataset(Dataset):
     def __init__(self, df: pd.DataFrame, seq_length: int = SEQ_LENGTH):
         self.df = df.reset_index(drop=True)
         self.seq_length = seq_length
-        # Pre-compute multi-hot vectors
         self.draw_vectors = []
         for _, row in df.iterrows():
             vec = np.zeros(NUMBERS, dtype=np.float32)
@@ -236,7 +258,6 @@ def train_model(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
     if len(df) < SEQ_LENGTH + 2:
         raise ValueError("Not enough data to train.")
     dataset = TotoDataset(df, seq_length=SEQ_LENGTH)
-    # Chronological split: last 20% validation
     n_val = max(1, int(0.2 * len(dataset)))
     n_train = len(dataset) - n_val
     train_set, val_set = torch.utils.data.random_split(
@@ -302,7 +323,6 @@ def predict_lstm() -> list | None:
     df = load_data()
     if len(df) < SEQ_LENGTH:
         return None
-    # Prepare last SEQ_LENGTH draws as multi-hot
     recent = df.tail(SEQ_LENGTH)
     seq = np.zeros((1, SEQ_LENGTH, NUMBERS), dtype=np.float32)
     for i, (_, row) in enumerate(recent.iterrows()):
@@ -333,7 +353,7 @@ def recent_sequence() -> np.ndarray:
 
 
 # ============================================
-#  4. MAIN (for CLI usage)
+#  4. MAIN (CLI)
 # ============================================
 if __name__ == "__main__":
     import argparse
@@ -345,6 +365,10 @@ if __name__ == "__main__":
     train_parser.add_argument("--epochs", type=int, default=50)
     predict_parser = sub.add_parser("predict", help="Print predictions")
 
+    backfill_parser = sub.add_parser("backfill", help="Fetch a range of historical draws")
+    backfill_parser.add_argument("--from", dest="start", type=int, required=True)
+    backfill_parser.add_argument("--to", dest="end", type=int, required=True)
+
     args = parser.parse_args()
     if args.command == "scrape":
         update_csv()
@@ -354,5 +378,7 @@ if __name__ == "__main__":
         df = load_data()
         print("LSTM prediction:", predict_lstm())
         print("Baseline (weighted):", weighted_lucky_pick(df))
+    elif args.command == "backfill":
+        backfill_draws(args.start, args.end)
     else:
         parser.print_help()
