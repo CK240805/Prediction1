@@ -61,7 +61,7 @@ with tab2:
     # Simple overlap with last draw
     if len(df) >= 1:
         last_draw = df.iloc[-1]
-        actual = set(last_draw[["num1","num2","num3","num4","num5","num6"]].values)
+        actual = set(last_draw[["n1","n2","n3","n4","n5","n6"]].values)  # <-- changed
         lstm_match = len(actual.intersection(lstm_pred)) if lstm_pred else 0
         base_match = len(actual.intersection(baseline_pred))
         st.metric("LSTM match with last draw", f"{lstm_match}/6")
@@ -69,6 +69,6 @@ with tab2:
 
 with tab3:
     st.header("Historical Results")
-    st.dataframe(df.sort_values("draw_date", ascending=False), use_container_width=True)
+    st.dataframe(df.sort_values("date", ascending=False), use_container_width=True)  # <-- changed
     csv = df.to_csv(index=False)
     st.download_button("Download CSV", csv, "toto_results.csv", "text/csv")
