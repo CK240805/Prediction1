@@ -1,0 +1,36 @@
+name: Backfill Historical Draws
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'First draw number'
+        required: true
+        type: number
+        default: 3900
+      end:
+        description: 'Last draw number (inclusive)'
+        required: true
+        type: number
+        default: 4050
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python toto_engine.py backfill --from ${{ inputs.start }} --to ${{ inputs.end }}
+      - name: Commit and push
+        run: |
+          git config user.name "toto-bot"
+          git config user.email "bot@example.com"
+          git add data/toto_results.csv
+          if git diff --staged --quiet; then
+            echo "No changes."
+          else
+            git commit -m "data: backfill draws ${{ inputs.start }}-${{ inputs.end }} [skip ci]"
+            git push
+          fi
