@@ -10,7 +10,6 @@ st.set_page_config(page_title="TOTO Predictor", layout="wide")
 st.title("🎰 Singapore TOTO Analytics & ML Predictor")
 st.caption("Institutional‑grade lottery analytics pipeline – for educational purposes only.")
 
-# Cache the data loading
 @st.cache_data(ttl=3600)
 def get_data():
     return load_data()
@@ -18,7 +17,7 @@ def get_data():
 df = get_data()
 
 if df.empty:
-    st.error("No data found. Run `python toto_engine.py scrape` first.")
+    st.error("No data found. Run `python toto_engine.py scrape` or `backfill` first.")
     st.stop()
 
 tab1, tab2, tab3 = st.tabs(["📊 Analytics", "🔮 Predictions", "📁 Raw Data"])
