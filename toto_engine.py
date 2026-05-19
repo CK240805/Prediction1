@@ -55,7 +55,7 @@ def extract_draw_json(html: str) -> dict:
     return json.loads(raw)
 
 def parse_draw(json_data: dict) -> dict:
-    """Convert JSON to a flat dict matching CSV schema."""
+    """Convert JSON to a flat dict matching the new CSV schema."""
     draw_no = int(json_data["DrawNumber"])
     draw_date = datetime.strptime(json_data["DrawDate"], "%d/%m/%Y").strftime("%Y-%m-%d")
     winning_numbers = sorted([int(n) for n in json_data["WinningNumbers"]])
@@ -63,27 +63,32 @@ def parse_draw(json_data: dict) -> dict:
     if len(winning_numbers) != 6 or not (1 <= additional <= 49):
         raise ValueError("Invalid numbers")
     return {
-        "draw_date": draw_date,
-        "draw_no": draw_no,
-        "num1": winning_numbers[0],
-        "num2": winning_numbers[1],
-        "num3": winning_numbers[2],
-        "num4": winning_numbers[3],
-        "num5": winning_numbers[4],
-        "num6": winning_numbers[5],
+        "draw_no": draw_no,          # first column as per new header
+        "date": draw_date,           # renamed from draw_date
+        "n1": winning_numbers[0],
+        "n2": winning_numbers[1],
+        "n3": winning_numbers[2],
+        "n4": winning_numbers[3],
+        "n5": winning_numbers[4],
+        "n6": winning_numbers[5],
         "additional": additional,
     }
 
+# The new CSV header is: draw_no,date,n1,n2,n3,n4,n5,n6,additional
+
 def update_csv():
     """Fetch latest draw, append to CSV if new."""
+    columns = ["draw_no", "date", "n1", "n2", "n3", "n4", "n5", "n6", "additional"]
     if CSV_PATH.exists():
-        df = pd.read_csv(CSV_PATH, parse_dates=["draw_date"])
-        df["draw_no"] = df["draw_no"].astype(int)
+        try:
+            df = pd.read_csv(CSV_PATH, parse_dates=["date"])
+            df["draw_no"] = df["draw_no"].astype(int)
+        except Exception as e:
+            print(f"Warning: failed to read existing CSV ({e}). Starting fresh.")
+            df = pd.DataFrame(columns=columns)
     else:
-        df = pd.DataFrame(columns=[
-            "draw_date", "draw_no", "num1", "num2", "num3",
-            "num4", "num5", "num6", "additional"
-        ])
+        df = pd.DataFrame(columns=columns)
+
     latest_known = df["draw_no"].max() if not df.empty else 4000
     html = fetch_page(latest_known + 1)
     try:
@@ -101,7 +106,8 @@ def update_csv():
 
 def backfill_draws(start_draw: int, end_draw: int):
     """Fetch and append historical draws from start_draw to end_draw (inclusive)."""
-    df = load_data() if CSV_PATH.exists() else pd.DataFrame()
+    columns = ["draw_no", "date", "n1", "n2", "n3", "n4", "n5", "n6", "additional"]
+    df = load_data() if CSV_PATH.exists() else pd.DataFrame(columns=columns)
     existing_draws = set(df["draw_no"]) if not df.empty else set()
 
     for draw_no in range(start_draw, end_draw + 1):
@@ -117,7 +123,7 @@ def backfill_draws(start_draw: int, end_draw: int):
             print(f"Added draw {draw_no}")
         except Exception as e:
             print(f"Failed to fetch draw {draw_no}: {e}")
-        time.sleep(1)  # be polite
+        time.sleep(1)
     df.to_csv(CSV_PATH, index=False)
     print(f"Backfill complete. Total draws: {len(df)}")
 
@@ -130,13 +136,13 @@ def load_data() -> pd.DataFrame:
     """Load CSV and return DataFrame."""
     if not CSV_PATH.exists():
         return pd.DataFrame()
-    df = pd.read_csv(CSV_PATH, parse_dates=["draw_date"])
+    df = pd.read_csv(CSV_PATH, parse_dates=["date"])
     return df
 
 def number_frequency_chart(df: pd.DataFrame, recent_n: int = None) -> go.Figure:
     """Bar chart of number frequencies."""
     subset = df if recent_n is None else df.tail(recent_n)
-    nums = subset[["num1","num2","num3","num4","num5","num6"]].values.flatten()
+    nums = subset[["n1","n2","n3","n4","n5","n6"]].values.flatten()   # <-- changed
     freq = pd.Series(nums).value_counts().reindex(range(1, 50), fill_value=0)
     fig = px.bar(
         x=freq.index.astype(str),
@@ -151,15 +157,15 @@ def overdue_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """DataFrame of how many draws since each number last appeared."""
     if df.empty:
         return pd.DataFrame(columns=["number", "draws_since"])
-    last_draw_no = df["draw_no"].max()
     results = []
     for num in range(1, 50):
+        # Check columns n1..n6
         mask = df[
-            (df["num1"]==num) | (df["num2"]==num) | (df["num3"]==num) |
-            (df["num4"]==num) | (df["num5"]==num) | (df["num6"]==num)
+            (df["n1"]==num) | (df["n2"]==num) | (df["n3"]==num) |
+            (df["n4"]==num) | (df["n5"]==num) | (df["n6"]==num)
         ]
         if mask.empty:
-            gap = 9999  # arbitrary large number
+            gap = 9999
         else:
             last_app = mask["draw_no"].max()
             gap = df[df["draw_no"] > last_app].shape[0]
@@ -171,7 +177,7 @@ def pair_heatmap(df: pd.DataFrame, recent_n: int = 200) -> go.Figure:
     subset = df.tail(recent_n)
     pair_count = np.zeros((49, 49), dtype=int)
     for _, row in subset.iterrows():
-        drawn = [row["num1"], row["num2"], row["num3"], row["num4"], row["num5"], row["num6"]]
+        drawn = [row["n1"], row["n2"], row["n3"], row["n4"], row["n5"], row["n6"]]
         for i in range(len(drawn)):
             for j in range(i+1, len(drawn)):
                 a, b = drawn[i]-1, drawn[j]-1
@@ -191,7 +197,7 @@ def hot_cold_table(df: pd.DataFrame, top_n: int = 10):
     """Return DataFrame of top hot/cold numbers."""
     if df.empty:
         return pd.DataFrame()
-    nums = df[["num1","num2","num3","num4","num5","num6"]].values.flatten()
+    nums = df[["n1","n2","n3","n4","n5","n6"]].values.flatten()
     freq = pd.Series(nums).value_counts().reindex(range(1,50), fill_value=0)
     hot = freq.nlargest(top_n).reset_index()
     hot.columns = ["number", "frequency"]
@@ -205,7 +211,7 @@ def weighted_lucky_pick(df: pd.DataFrame):
     """Returns 6 numbers sampled according to empirical frequency."""
     if df.empty:
         return sorted(np.random.choice(range(1,50), size=6, replace=False).tolist())
-    nums = df[["num1","num2","num3","num4","num5","num6"]].values.flatten()
+    nums = df[["n1","n2","n3","n4","n5","n6"]].values.flatten()
     freq = pd.Series(nums).value_counts().reindex(range(1,50), fill_value=0)
     prob = freq / freq.sum()
     pick = np.random.choice(prob.index, size=6, replace=False, p=prob.values)
@@ -224,7 +230,7 @@ class TotoDataset(Dataset):
         self.draw_vectors = []
         for _, row in df.iterrows():
             vec = np.zeros(NUMBERS, dtype=np.float32)
-            for col in ["num1","num2","num3","num4","num5","num6"]:
+            for col in ["n1","n2","n3","n4","n5","n6"]:   # <-- changed
                 vec[int(row[col]) - 1] = 1.0
             self.draw_vectors.append(vec)
         self.draw_vectors = np.array(self.draw_vectors)
@@ -326,7 +332,7 @@ def predict_lstm() -> list | None:
     recent = df.tail(SEQ_LENGTH)
     seq = np.zeros((1, SEQ_LENGTH, NUMBERS), dtype=np.float32)
     for i, (_, row) in enumerate(recent.iterrows()):
-        for col in ["num1","num2","num3","num4","num5","num6"]:
+        for col in ["n1","n2","n3","n4","n5","n6"]:   # <-- changed
             seq[0, i, int(row[col]) - 1] = 1.0
     device = torch.device("cpu")
     model = TotoPredictor()
@@ -347,7 +353,7 @@ def recent_sequence() -> np.ndarray:
     recent = df.tail(SEQ_LENGTH)
     seq = np.zeros((SEQ_LENGTH, NUMBERS), dtype=np.float32)
     for i, (_, row) in enumerate(recent.iterrows()):
-        for col in ["num1","num2","num3","num4","num5","num6"]:
+        for col in ["n1","n2","n3","n4","n5","n6"]:
             seq[i, int(row[col]) - 1] = 1.0
     return seq
 
