@@ -2,21 +2,37 @@ name: Retrain LSTM
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 1'   # every Monday
+    - cron: '0 3 * * 1'   # every Monday at 3 AM UTC (11 AM SGT)
+
 jobs:
   train:
     runs-on: ubuntu-latest
+    permissions:                # allows committing and pushing
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python toto_engine.py train --epochs 30
-      - name: Commit model
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train model
+        run: python toto_engine.py train --epochs 30
+
+      - name: Commit and push new model weights
         run: |
           git config user.name "toto-bot"
-          git config user.email "bot@example.com"
+          git config user.email "toto-bot@example.com"
           git add ml/model_weights.pt
-          git diff --staged --quiet || git commit -m "model: update weights [skip ci]"
-          git push
+          if git diff --staged --quiet; then
+            echo "Model weights unchanged."
+          else
+            git commit -m "model: update weights [skip ci]"
+            git push
+          fi
