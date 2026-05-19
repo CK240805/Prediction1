@@ -1,11 +1,15 @@
 name: Update TOTO Data
 on:
   schedule:
-    - cron: '0 2 * * *'   # 10 AM SGT (UTC+8)
+    - cron: '0 2 * * *'
   workflow_dispatch:
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    permissions:                # <-- add this block
+      contents: write           # allows pushing commits
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -13,10 +17,14 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - run: python toto_engine.py scrape
-      - name: Commit changes
+      - name: Commit and push
         run: |
           git config user.name "toto-bot"
-          git config user.email "bot@example.com"
+          git config user.email "toto-bot@example.com"
           git add data/toto_results.csv
-          git diff --staged --quiet || git commit -m "data: update [skip ci]"
-          git push
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "data: update [skip ci]"
+            git push
+          fi
