@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-.env
-ml/model_weights.pt
-.streamlit/secrets.toml
