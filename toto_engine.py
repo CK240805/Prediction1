@@ -1,5 +1,7 @@
 """
 toto_engine.py – Unified core for Singapore TOTO scraper, analytics, ML, and backfill.
+Now predicts BOTH the 6 main numbers and the additional number (7 unique numbers total).
+Uses CSV header: draw_no,date,n1,n2,n3,n4,n5,n6,additional
 """
 import re
 import json
@@ -13,7 +15,8 @@ from datetime import datetime
 from pathlib import Path
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
 
 # -------------------------------
 #  Configuration
@@ -55,7 +58,7 @@ def extract_draw_json(html: str) -> dict:
     return json.loads(raw)
 
 def parse_draw(json_data: dict) -> dict:
-    """Convert JSON to a flat dict matching the new CSV schema."""
+    """Convert JSON to a flat dict matching the CSV schema."""
     draw_no = int(json_data["DrawNumber"])
     draw_date = datetime.strptime(json_data["DrawDate"], "%d/%m/%Y").strftime("%Y-%m-%d")
     winning_numbers = sorted([int(n) for n in json_data["WinningNumbers"]])
@@ -63,8 +66,8 @@ def parse_draw(json_data: dict) -> dict:
     if len(winning_numbers) != 6 or not (1 <= additional <= 49):
         raise ValueError("Invalid numbers")
     return {
-        "draw_no": draw_no,          # first column as per new header
-        "date": draw_date,           # renamed from draw_date
+        "draw_no": draw_no,
+        "date": draw_date,
         "n1": winning_numbers[0],
         "n2": winning_numbers[1],
         "n3": winning_numbers[2],
@@ -73,8 +76,6 @@ def parse_draw(json_data: dict) -> dict:
         "n6": winning_numbers[5],
         "additional": additional,
     }
-
-# The new CSV header is: draw_no,date,n1,n2,n3,n4,n5,n6,additional
 
 def update_csv():
     """Fetch latest draw, append to CSV if new."""
@@ -142,7 +143,7 @@ def load_data() -> pd.DataFrame:
 def number_frequency_chart(df: pd.DataFrame, recent_n: int = None) -> go.Figure:
     """Bar chart of number frequencies."""
     subset = df if recent_n is None else df.tail(recent_n)
-    nums = subset[["n1","n2","n3","n4","n5","n6"]].values.flatten()   # <-- changed
+    nums = subset[["n1","n2","n3","n4","n5","n6"]].values.flatten()
     freq = pd.Series(nums).value_counts().reindex(range(1, 50), fill_value=0)
     fig = px.bar(
         x=freq.index.astype(str),
@@ -159,7 +160,6 @@ def overdue_analysis(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["number", "draws_since"])
     results = []
     for num in range(1, 50):
-        # Check columns n1..n6
         mask = df[
             (df["n1"]==num) | (df["n2"]==num) | (df["n3"]==num) |
             (df["n4"]==num) | (df["n5"]==num) | (df["n6"]==num)
@@ -208,32 +208,57 @@ def hot_cold_table(df: pd.DataFrame, top_n: int = 10):
     return pd.concat([hot, cold], ignore_index=True)
 
 def weighted_lucky_pick(df: pd.DataFrame):
-    """Returns 6 numbers sampled according to empirical frequency."""
+    """
+    Returns 6 main numbers + 1 additional number (all distinct) sampled
+    according to empirical frequency.
+    """
     if df.empty:
-        return sorted(np.random.choice(range(1,50), size=6, replace=False).tolist())
+        main = sorted(np.random.choice(range(1,50), size=6, replace=False).tolist())
+        remaining = list(set(range(1,50)) - set(main))
+        add = int(np.random.choice(remaining))
+        return main, add
+
     nums = df[["n1","n2","n3","n4","n5","n6"]].values.flatten()
     freq = pd.Series(nums).value_counts().reindex(range(1,50), fill_value=0)
     prob = freq / freq.sum()
-    pick = np.random.choice(prob.index, size=6, replace=False, p=prob.values)
-    return sorted(pick.tolist())
+
+    # Pick 6 main numbers without replacement
+    main = list(np.random.choice(prob.index, size=6, replace=False, p=prob.values))
+    main.sort()
+
+    # Pick additional from remaining numbers, weighted by same freq
+    remaining_idx = [i for i in range(1,50) if i not in main]
+    remaining_prob = prob[remaining_idx] / prob[remaining_idx].sum()
+    add = int(np.random.choice(remaining_idx, size=1, p=remaining_prob.values)[0])
+
+    return main, add
 
 
 # ============================================
-#  3. MACHINE LEARNING (LSTM)
+#  3. MACHINE LEARNING (LSTM) – NOW WITH ADDITIONAL NUMBER
 # ============================================
 
 class TotoDataset(Dataset):
-    """Converts draws to multi‑hot sequence windows."""
+    """
+    Converts draws to sequence windows.
+    Returns:
+        x: (seq_length, 49) multi‑hot for the 6 main numbers
+        y_main: (49,) multi‑hot for the 6 main numbers (target)
+        y_add: integer (0‑48) index of the additional number
+    """
     def __init__(self, df: pd.DataFrame, seq_length: int = SEQ_LENGTH):
         self.df = df.reset_index(drop=True)
         self.seq_length = seq_length
-        self.draw_vectors = []
+        self.draw_vectors = []   # main numbers multi-hot
+        self.additionals = []    # additional number index
         for _, row in df.iterrows():
             vec = np.zeros(NUMBERS, dtype=np.float32)
-            for col in ["n1","n2","n3","n4","n5","n6"]:   # <-- changed
+            for col in ["n1","n2","n3","n4","n5","n6"]:
                 vec[int(row[col]) - 1] = 1.0
             self.draw_vectors.append(vec)
+            self.additionals.append(int(row["additional"]) - 1)  # 0-indexed
         self.draw_vectors = np.array(self.draw_vectors)
+        self.additionals = np.array(self.additionals)
         self.valid_starts = list(range(len(self.draw_vectors) - seq_length))
 
     def __len__(self):
@@ -242,40 +267,61 @@ class TotoDataset(Dataset):
     def __getitem__(self, idx):
         start = self.valid_starts[idx]
         x = self.draw_vectors[start:start + self.seq_length]
-        y = self.draw_vectors[start + self.seq_length]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        y_main = self.draw_vectors[start + self.seq_length]
+        y_add = self.additionals[start + self.seq_length]
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y_main, dtype=torch.float32),
+            torch.tensor(y_add, dtype=torch.long)
+        )
 
 
 class TotoPredictor(nn.Module):
+    """
+    LSTM with two heads:
+      - main head: 49‑dim sigmoid (for 6 main numbers)
+      - add head : 49‑dim logits (for additional number, softmax later)
+    """
     def __init__(self, input_dim=NUMBERS, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_dim, input_dim)
+        self.fc_main = nn.Linear(hidden_dim, input_dim)   # main numbers
+        self.fc_add  = nn.Linear(hidden_dim, input_dim)   # additional number
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])   # last time step
-        return out  # raw logits
+        out, _ = self.lstm(x)          # out: (batch, seq_len, hidden)
+        last = out[:, -1, :]           # last time step
+        main_logits = self.fc_main(last)
+        add_logits  = self.fc_add(last)
+        return main_logits, add_logits
 
 
 def train_model(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
-    """Train the LSTM model and save weights."""
+    """
+    Train the LSTM model (90% train / 10% test) and save weights.
+    After training, prints evaluation on the test set.
+    """
     df = load_data()
     if len(df) < SEQ_LENGTH + 2:
         raise ValueError("Not enough data to train.")
+
     dataset = TotoDataset(df, seq_length=SEQ_LENGTH)
-    n_val = max(1, int(0.2 * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    n_total = len(dataset)
+    n_train = int(0.9 * n_total)   # 90% training
+    n_test = n_total - n_train     # 10% testing
+
+    train_set = Subset(dataset, range(0, n_train))
+    test_set  = Subset(dataset, range(n_train, n_total))
+
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_set, batch_size=batch_size, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TotoPredictor().to(device)
-    criterion = nn.BCEWithLogitsLoss()
+
+    criterion_main = nn.BCEWithLogitsLoss()    # multi-label for main numbers
+    criterion_add  = nn.CrossEntropyLoss()     # single-class for additional
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val_loss = float("inf")
@@ -285,25 +331,31 @@ def train_model(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
+        for xb, y_main, y_add in train_loader:
+            xb = xb.to(device)
+            y_main = y_main.to(device)
+            y_add = y_add.to(device)
+
             optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
+            main_logits, add_logits = model(xb)
+            loss = criterion_main(main_logits, y_main) + criterion_add(add_logits, y_add)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * xb.size(0)
         train_loss /= len(train_set)
 
+        # Validation (on test set, but still call it val loss)
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                logits = model(xb)
-                loss = criterion(logits, yb)
+            for xb, y_main, y_add in test_loader:
+                xb = xb.to(device)
+                y_main = y_main.to(device)
+                y_add = y_add.to(device)
+                main_logits, add_logits = model(xb)
+                loss = criterion_main(main_logits, y_main) + criterion_add(add_logits, y_add)
                 val_loss += loss.item() * xb.size(0)
-        val_loss /= len(val_set)
+        val_loss /= len(test_set)
 
         print(f"Epoch {epoch:3d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         if val_loss < best_val_loss:
@@ -318,44 +370,86 @@ def train_model(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
                 print("Early stopping.")
                 break
 
+    # Load best model and evaluate on test set
     model.load_state_dict(torch.load(MODEL_PATH))
+    model.eval()
+
+    total_main_matches = 0
+    total_add_correct = 0
+    n_samples = 0
+    with torch.no_grad():
+        for xb, y_main, y_add in test_loader:
+            xb = xb.to(device)
+            main_logits, add_logits = model(xb)
+            # Main numbers: top‑6 from sigmoid
+            probs_main = torch.sigmoid(main_logits)      # (batch, 49)
+            _, top6_indices = torch.topk(probs_main, 6, dim=1)   # (batch, 6)
+            # Additional number: pick highest logit that is NOT in top6
+            add_preds = []
+            for i in range(xb.size(0)):
+                top6 = set(top6_indices[i].tolist())
+                # Mask the top6 indices to -inf so we don't pick them
+                masked = add_logits[i].clone()
+                masked[list(top6)] = -float('inf')
+                add_pred = torch.argmax(masked).item()
+                add_preds.append(add_pred)
+            add_preds = torch.tensor(add_preds, device=device)
+
+            # Count matches
+            for i in range(xb.size(0)):
+                true_main_set = set(y_main[i].nonzero(as_tuple=True)[0].tolist())
+                pred_main_set = set(top6_indices[i].tolist())
+                total_main_matches += len(true_main_set.intersection(pred_main_set))
+                if add_preds[i].item() == y_add[i].item():
+                    total_add_correct += 1
+                n_samples += 1
+
+    avg_main_matches = total_main_matches / n_samples if n_samples > 0 else 0
+    add_accuracy = total_add_correct / n_samples if n_samples > 0 else 0
+    print(f"\nTest set evaluation ({n_samples} samples):")
+    print(f"Average main-number matches (out of 6): {avg_main_matches:.2f}")
+    print(f"Additional number accuracy: {add_accuracy:.4f} ({total_add_correct}/{n_samples})")
+
     return model
 
 
-def predict_lstm() -> list | None:
-    """Predict next draw using trained LSTM weights. Returns 6 numbers or None."""
+def predict_lstm() -> tuple | None:
+    """
+    Predict the next draw using the trained LSTM.
+    Returns:
+        (main_numbers: list of 6 ints, additional: int) or None if no model.
+    """
     if not MODEL_PATH.exists():
         return None
     df = load_data()
     if len(df) < SEQ_LENGTH:
         return None
+
+    # Prepare last SEQ_LENGTH draws
     recent = df.tail(SEQ_LENGTH)
     seq = np.zeros((1, SEQ_LENGTH, NUMBERS), dtype=np.float32)
     for i, (_, row) in enumerate(recent.iterrows()):
-        for col in ["n1","n2","n3","n4","n5","n6"]:   # <-- changed
+        for col in ["n1","n2","n3","n4","n5","n6"]:
             seq[0, i, int(row[col]) - 1] = 1.0
+
     device = torch.device("cpu")
     model = TotoPredictor()
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
+
     with torch.no_grad():
-        logits = model(torch.tensor(seq)).squeeze(0)
-        probs = torch.sigmoid(logits).numpy()
-    top6 = np.argsort(probs)[-6:] + 1
-    return sorted(top6.tolist())
+        main_logits, add_logits = model(torch.tensor(seq).to(device))
+        probs_main = torch.sigmoid(main_logits).squeeze(0)   # (49,)
+        top6 = torch.topk(probs_main, 6).indices.tolist()    # 0-indexed
+        # Pick additional: highest add logit not in top6
+        add_logits = add_logits.squeeze(0)
+        for idx in top6:
+            add_logits[idx] = -float('inf')
+        add_pred = int(torch.argmax(add_logits).item())
 
-
-def recent_sequence() -> np.ndarray:
-    """Return the most recent SEQ_LENGTH draws as multi-hot array."""
-    df = load_data()
-    if len(df) < SEQ_LENGTH:
-        return None
-    recent = df.tail(SEQ_LENGTH)
-    seq = np.zeros((SEQ_LENGTH, NUMBERS), dtype=np.float32)
-    for i, (_, row) in enumerate(recent.iterrows()):
-        for col in ["n1","n2","n3","n4","n5","n6"]:
-            seq[i, int(row[col]) - 1] = 1.0
-    return seq
+    main_numbers = sorted([n + 1 for n in top6])
+    additional = add_pred + 1
+    return main_numbers, additional
 
 
 # ============================================
@@ -382,8 +476,13 @@ if __name__ == "__main__":
         train_model(epochs=args.epochs)
     elif args.command == "predict":
         df = load_data()
-        print("LSTM prediction:", predict_lstm())
-        print("Baseline (weighted):", weighted_lucky_pick(df))
+        lstm_pred = predict_lstm()
+        base_main, base_add = weighted_lucky_pick(df)
+        if lstm_pred:
+            print(f"LSTM prediction: Main: {lstm_pred[0]}  Additional: {lstm_pred[1]}")
+        else:
+            print("LSTM model not available.")
+        print(f"Baseline (weighted): Main: {base_main}  Additional: {base_add}")
     elif args.command == "backfill":
         backfill_draws(args.start, args.end)
     else:
