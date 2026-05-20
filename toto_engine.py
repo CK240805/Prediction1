@@ -265,7 +265,7 @@ class LottoTransformer(nn.Module):
 
 
 # ============================================
-#  4. TRAINING (Ensemble: train both, save combined)
+#  4. TRAINING (Ensemble)
 # ============================================
 
 def train_one_epoch(model, loader, optimizer, criterion_main, criterion_add, device, clip=1.0):
@@ -296,7 +296,7 @@ def eval_loss(model, loader, criterion_main, criterion_add, device):
 
 def train_single_model(model, train_loader, test_loader, epochs, lr, device, model_name):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=False)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)  # verbose removed
     criterion_main = nn.BCEWithLogitsLoss()
     criterion_add = nn.CrossEntropyLoss()
 
@@ -381,7 +381,6 @@ def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
             probs_add = (F.softmax(add_log_l, dim=1) + F.softmax(add_log_t, dim=1)) / 2.0
 
             _, top6 = torch.topk(probs_main, 6, dim=1)
-            # Additional: pick highest prob not in top6
             add_preds = []
             for i in range(xb.size(0)):
                 top_set = set(top6[i].tolist())
@@ -426,16 +425,9 @@ def predict_ensemble() -> tuple | None:
 
     device = torch.device("cpu")
     checkpoint = torch.load(MODEL_PATH, map_location=device)
-    # Expect dict with keys 'lstm' and 'transformer'
-    if "lstm" not in checkpoint or "transformer" not in checkpoint:
-        print("Saved model is not an ensemble. Falling back to single model.")
-        # If it's an old state dict (single model), try to load as LSTM
-        model = LottoLSTM()
-        model.load_state_dict(checkpoint, strict=False)
-        model.eval()
-        with torch.no_grad():
-            main_logits, add_logits = model(torch.tensor(seq))
-    else:
+
+    # If the saved file is a dict with 'lstm' and 'transformer', use ensemble
+    if isinstance(checkpoint, dict) and "lstm" in checkpoint and "transformer" in checkpoint:
         lstm_model = LottoLSTM()
         lstm_model.load_state_dict(checkpoint["lstm"])
         lstm_model.eval()
@@ -446,19 +438,27 @@ def predict_ensemble() -> tuple | None:
         with torch.no_grad():
             main_l, add_l = lstm_model(torch.tensor(seq))
             main_t, add_t = tf_model(torch.tensor(seq))
-            # Ensemble: average probabilities
             probs_main = (torch.sigmoid(main_l) + torch.sigmoid(main_t)) / 2.0
             probs_add = (F.softmax(add_l, dim=1) + F.softmax(add_t, dim=1)) / 2.0
-            main_logits = probs_main.squeeze(0)     # we need logits-style for topk, but we already have probs
-            add_logits = probs_add.squeeze(0)
-    # At this point we have `main_logits` (49-d tensor of probabilities) and `add_logits`
-    # `main_logits` might be from sigmoid or ensemble probs; both work for topk.
-    top6 = torch.topk(main_logits, 6).indices.tolist()
-    # Additional: highest probability not in top6
-    add_logits_copy = add_logits.clone()
+            main_probs = probs_main.squeeze(0)
+            add_probs = probs_add.squeeze(0)
+    else:
+        # Fallback for single model (LSTM or old weights)
+        model = LottoLSTM()
+        model.load_state_dict(checkpoint, strict=False)
+        model.eval()
+        with torch.no_grad():
+            main_logits, add_logits = model(torch.tensor(seq))
+            main_probs = torch.sigmoid(main_logits).squeeze(0)
+            add_probs = F.softmax(add_logits, dim=1).squeeze(0)
+
+    # Pick top 6 main numbers from main_probs
+    top6 = torch.topk(main_probs, 6).indices.tolist()
+    # Additional: highest prob not in top6
+    add_probs_copy = add_probs.clone()
     for idx in top6:
-        add_logits_copy[idx] = -1
-    add_pred = int(torch.argmax(add_logits_copy).item())
+        add_probs_copy[idx] = -1
+    add_pred = int(torch.argmax(add_probs_copy).item())
 
     main_numbers = sorted([n + 1 for n in top6])
     additional = add_pred + 1
