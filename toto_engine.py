@@ -265,7 +265,7 @@ class LottoTransformer(nn.Module):
 
 
 # ============================================
-#  4. TRAINING (Ensemble)
+#  4. TRAINING (Ensemble) – now with configurable patience
 # ============================================
 
 def train_one_epoch(model, loader, optimizer, criterion_main, criterion_add, device, clip=1.0):
@@ -294,14 +294,13 @@ def eval_loss(model, loader, criterion_main, criterion_add, device):
     return total_loss / len(loader.dataset)
 
 
-def train_single_model(model, train_loader, test_loader, epochs, lr, device, model_name):
+def train_single_model(model, train_loader, test_loader, epochs, lr, device, model_name, patience=20):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)  # verbose removed
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     criterion_main = nn.BCEWithLogitsLoss()
     criterion_add = nn.CrossEntropyLoss()
 
     best_val = float("inf")
-    patience = 20
     no_improve = 0
     best_state = None
 
@@ -324,7 +323,7 @@ def train_single_model(model, train_loader, test_loader, epochs, lr, device, mod
     return best_state, best_val
 
 
-def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
+def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3, patience: int = 20):
     """Train both LSTM and Transformer, save combined weights."""
     df = load_data()
     if len(df) < SEQ_LENGTH + 2:
@@ -347,12 +346,12 @@ def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
     print("\n=== Training LSTM ===")
     lstm_model = LottoLSTM(dropout=0.3).to(device)
     lstm_state, lstm_val = train_single_model(lstm_model, train_loader, test_loader,
-                                              epochs, lr, device, "LSTM")
+                                              epochs, lr, device, "LSTM", patience=patience)
     # Train Transformer
     print("\n=== Training Transformer ===")
     tf_model = LottoTransformer(dropout=0.1).to(device)
     tf_state, tf_val = train_single_model(tf_model, train_loader, test_loader,
-                                          epochs, lr, device, "Transformer")
+                                          epochs, lr, device, "Transformer", patience=patience)
 
     # Save combined weights
     MODEL_PATH.parent.mkdir(exist_ok=True)
@@ -372,11 +371,8 @@ def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3):
     with torch.no_grad():
         for xb, y_main, y_add in test_loader:
             xb = xb.to(device)
-            # LSTM
             main_log_l, add_log_l = lstm_model(xb)
-            # Transformer
             main_log_t, add_log_t = tf_model(xb)
-            # Ensemble: average probabilities
             probs_main = (torch.sigmoid(main_log_l) + torch.sigmoid(main_log_t)) / 2.0
             probs_add = (F.softmax(add_log_l, dim=1) + F.softmax(add_log_t, dim=1)) / 2.0
 
@@ -426,7 +422,6 @@ def predict_ensemble() -> tuple | None:
     device = torch.device("cpu")
     checkpoint = torch.load(MODEL_PATH, map_location=device)
 
-    # If the saved file is a dict with 'lstm' and 'transformer', use ensemble
     if isinstance(checkpoint, dict) and "lstm" in checkpoint and "transformer" in checkpoint:
         lstm_model = LottoLSTM()
         lstm_model.load_state_dict(checkpoint["lstm"])
@@ -443,7 +438,7 @@ def predict_ensemble() -> tuple | None:
             main_probs = probs_main.squeeze(0)
             add_probs = probs_add.squeeze(0)
     else:
-        # Fallback for single model (LSTM or old weights)
+        # Fallback for single model
         model = LottoLSTM()
         model.load_state_dict(checkpoint, strict=False)
         model.eval()
@@ -452,9 +447,7 @@ def predict_ensemble() -> tuple | None:
             main_probs = torch.sigmoid(main_logits).squeeze(0)
             add_probs = F.softmax(add_logits, dim=1).squeeze(0)
 
-    # Pick top 6 main numbers from main_probs
     top6 = torch.topk(main_probs, 6).indices.tolist()
-    # Additional: highest prob not in top6
     add_probs_copy = add_probs.clone()
     for idx in top6:
         add_probs_copy[idx] = -1
@@ -466,7 +459,7 @@ def predict_ensemble() -> tuple | None:
 
 
 # ============================================
-#  6. MAIN (CLI)
+#  6. MAIN (CLI) – now with --patience
 # ============================================
 if __name__ == "__main__":
     import argparse
@@ -476,7 +469,8 @@ if __name__ == "__main__":
     scrape_parser = sub.add_parser("scrape", help="Update CSV with latest draw")
 
     train_parser = sub.add_parser("train", help="Train ensemble (LSTM + Transformer)")
-    train_parser.add_argument("--epochs", type=int, default=50)
+    train_parser.add_argument("--epochs", type=int, default=50, help="Max training epochs")
+    train_parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
 
     predict_parser = sub.add_parser("predict", help="Print ensemble predictions")
 
@@ -488,7 +482,7 @@ if __name__ == "__main__":
     if args.command == "scrape":
         update_csv()
     elif args.command == "train":
-        train_ensemble(epochs=args.epochs)
+        train_ensemble(epochs=args.epochs, patience=args.patience)
     elif args.command == "predict":
         df = load_data()
         pred = predict_ensemble()
