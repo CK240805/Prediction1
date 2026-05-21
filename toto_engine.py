@@ -1,6 +1,6 @@
 """
 toto_engine.py – Unified core for Singapore TOTO scraper, analytics, ML, and backfill.
-Ensemble: LSTM + Transformer predictions combined.
+Ensemble: LSTM + Transformer, now with day‑of‑week features and Monte Carlo dropout.
 Predicts 6 main numbers + additional number (7 unique numbers total).
 CSV header: draw_no,date,n1,n2,n3,n4,n5,n6,additional
 """
@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -28,10 +28,15 @@ BASE_URL = "https://www.singaporepools.com.sg/en/product/sr/Pages/toto_results.a
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 SEQ_LENGTH = 10
 NUMBERS = 49
+EXTRA_FEATURES = 1               # day of week (0 = Monday, 1 = Thursday)
+INPUT_DIM = NUMBERS + EXTRA_FEATURES   # 50
 HIDDEN_DIM = 128
-NUM_LAYERS = 2          # for LSTM
-NHEAD = 4               # for Transformer
-NUM_ENCODER_LAYERS = 2  # for Transformer
+NUM_LAYERS = 2
+NHEAD = 4
+NUM_ENCODER_LAYERS = 2
+
+# Monte Carlo dropout parameters
+MC_SAMPLES = 20                  # number of stochastic forward passes
 
 # ============================================
 #  1. DATA SCRAPING & CSV MANAGEMENT
@@ -195,45 +200,61 @@ def weighted_lucky_pick(df: pd.DataFrame):
 
 
 # ============================================
-#  3. MACHINE LEARNING MODELS
+#  3. MACHINE LEARNING MODELS (now with extra features)
 # ============================================
+
+def get_day_feature(date_str: str) -> float:
+    """Return 0.0 for Monday, 1.0 for Thursday. (Draws are Mon/Thu.)"""
+    dt = pd.Timestamp(date_str)
+    # Monday = 0, Thursday = 3 in pandas weekday (Monday=0)
+    wd = dt.weekday()
+    if wd == 0:   # Monday
+        return 0.0
+    elif wd == 3: # Thursday
+        return 1.0
+    else:
+        # Fallback (shouldn't happen) – map other days to nearest
+        return 0.0 if wd < 3 else 1.0
 
 class TotoDataset(Dataset):
     def __init__(self, df: pd.DataFrame, seq_length: int = SEQ_LENGTH):
         self.df = df.reset_index(drop=True)
         self.seq_length = seq_length
-        self.draw_vectors = []
+        self.vectors = []   # each element: (49+1)-dim feature
         self.additionals = []
         for _, row in df.iterrows():
-            vec = np.zeros(NUMBERS, dtype=np.float32)
+            vec = np.zeros(INPUT_DIM, dtype=np.float32)   # 50
             for col in ["n1","n2","n3","n4","n5","n6"]:
                 vec[int(row[col]) - 1] = 1.0
-            self.draw_vectors.append(vec)
+            # Append day feature
+            day_feat = get_day_feature(str(row["date"]))
+            vec[NUMBERS] = day_feat   # index 49 = last position
+            self.vectors.append(vec)
             self.additionals.append(int(row["additional"]) - 1)
-        self.draw_vectors = np.array(self.draw_vectors)
+        self.vectors = np.array(self.vectors)
         self.additionals = np.array(self.additionals)
-        self.valid_starts = list(range(len(self.draw_vectors) - seq_length))
+        self.valid_starts = list(range(len(self.vectors) - seq_length))
 
     def __len__(self):
         return len(self.valid_starts)
 
     def __getitem__(self, idx):
         start = self.valid_starts[idx]
-        x = self.draw_vectors[start:start + self.seq_length]
-        y_main = self.draw_vectors[start + self.seq_length]
+        x = self.vectors[start:start + self.seq_length]   # (seq_len, 50)
+        y_main = self.vectors[start + self.seq_length][:NUMBERS].copy()   # main part (49)
         y_add = self.additionals[start + self.seq_length]
         return (torch.tensor(x, dtype=torch.float32),
                 torch.tensor(y_main, dtype=torch.float32),
                 torch.tensor(y_add, dtype=torch.long))
 
 
-# LSTM model
+# LSTM model (input_dim now 50)
 class LottoLSTM(nn.Module):
-    def __init__(self, input_dim=NUMBERS, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=0.3):
+    def __init__(self, input_dim=INPUT_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=0.3):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        self.fc_main = nn.Linear(hidden_dim, input_dim)
-        self.fc_add  = nn.Linear(hidden_dim, input_dim)
+        self.fc_main = nn.Linear(hidden_dim, NUMBERS)
+        self.fc_add  = nn.Linear(hidden_dim, NUMBERS)
 
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -243,17 +264,17 @@ class LottoLSTM(nn.Module):
         return main_logits, add_logits
 
 
-# Transformer model
+# Transformer model (input_dim now 50)
 class LottoTransformer(nn.Module):
-    def __init__(self, input_dim=NUMBERS, hidden_dim=HIDDEN_DIM, nhead=NHEAD,
+    def __init__(self, input_dim=INPUT_DIM, hidden_dim=HIDDEN_DIM, nhead=NHEAD,
                  num_encoder_layers=NUM_ENCODER_LAYERS, dropout=0.1):
         super().__init__()
         self.input_fc = nn.Linear(input_dim, hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead,
                                                    dropout=dropout, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-        self.fc_main = nn.Linear(hidden_dim, input_dim)
-        self.fc_add  = nn.Linear(hidden_dim, input_dim)
+        self.fc_main = nn.Linear(hidden_dim, NUMBERS)
+        self.fc_add  = nn.Linear(hidden_dim, NUMBERS)
 
     def forward(self, x):
         x = self.input_fc(x)
@@ -265,7 +286,7 @@ class LottoTransformer(nn.Module):
 
 
 # ============================================
-#  4. TRAINING (Ensemble) – now with configurable patience
+#  4. TRAINING (Ensemble) – unchanged except for patience
 # ============================================
 
 def train_one_epoch(model, loader, optimizer, criterion_main, criterion_add, device, clip=1.0):
@@ -324,7 +345,6 @@ def train_single_model(model, train_loader, test_loader, epochs, lr, device, mod
 
 
 def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3, patience: int = 20):
-    """Train both LSTM and Transformer, save combined weights."""
     df = load_data()
     if len(df) < SEQ_LENGTH + 2:
         raise ValueError("Not enough data to train.")
@@ -342,23 +362,19 @@ def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3, pat
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
 
-    # Train LSTM
     print("\n=== Training LSTM ===")
     lstm_model = LottoLSTM(dropout=0.3).to(device)
     lstm_state, lstm_val = train_single_model(lstm_model, train_loader, test_loader,
                                               epochs, lr, device, "LSTM", patience=patience)
-    # Train Transformer
     print("\n=== Training Transformer ===")
     tf_model = LottoTransformer(dropout=0.1).to(device)
     tf_state, tf_val = train_single_model(tf_model, train_loader, test_loader,
                                           epochs, lr, device, "Transformer", patience=patience)
 
-    # Save combined weights
     MODEL_PATH.parent.mkdir(exist_ok=True)
     torch.save({"lstm": lstm_state, "transformer": tf_state}, MODEL_PATH)
     print(f"\nEnsemble weights saved to {MODEL_PATH}")
 
-    # Evaluate ensemble on test set
     print("\n=== Ensemble Evaluation on Test Set ===")
     lstm_model.load_state_dict(lstm_state)
     tf_model.load_state_dict(tf_state)
@@ -402,22 +418,68 @@ def train_ensemble(epochs: int = 50, batch_size: int = 32, lr: float = 1e-3, pat
 
 
 # ============================================
-#  5. PREDICTION (Ensemble)
+#  5. PREDICTION (Ensemble with MC dropout)
 # ============================================
 
+def predict_next_draw_day(df: pd.DataFrame) -> float:
+    """Guess the day feature of the next draw based on the last draw date."""
+    if df.empty:
+        return 0.0
+    last_date = pd.Timestamp(df["date"].iloc[-1])
+    # draws are Monday (0) and Thursday (3). Compute next draw date:
+    if last_date.weekday() == 0:   # Monday -> next Thursday
+        next_date = last_date + timedelta(days=3)
+    else:                          # Thursday -> next Monday
+        next_date = last_date + timedelta(days=4)
+    # Ensure correct feature
+    return get_day_feature(next_date.strftime("%Y-%m-%d"))
+
+def _ensemble_forward(models, seq, mc_samples=MC_SAMPLES):
+    """
+    Run multiple stochastic forward passes with dropout active,
+    average the probabilities from both models.
+    returns: main_probs (49,), add_probs (49,)
+    """
+    device = torch.device("cpu")
+    lstm_model, tf_model = models
+    # Enable dropout for MC
+    lstm_model.train()
+    tf_model.train()
+    main_sum = torch.zeros(NUMBERS)
+    add_sum = torch.zeros(NUMBERS)
+    for _ in range(mc_samples):
+        with torch.no_grad():
+            main_l, add_l = lstm_model(seq)
+            main_t, add_t = tf_model(seq)
+            main_prob = (torch.sigmoid(main_l) + torch.sigmoid(main_t)) / 2.0
+            add_prob = (F.softmax(add_l, dim=1) + F.softmax(add_t, dim=1)) / 2.0
+            main_sum += main_prob.squeeze(0).cpu()
+            add_sum += add_prob.squeeze(0).cpu()
+    main_avg = main_sum / mc_samples
+    add_avg = add_sum / mc_samples
+    return main_avg, add_avg
+
 def predict_ensemble() -> tuple | None:
-    """Predict next draw using ensemble of LSTM and Transformer."""
     if not MODEL_PATH.exists():
         return None
     df = load_data()
     if len(df) < SEQ_LENGTH:
         return None
 
+    # Get the last SEQ_LENGTH draws
     recent = df.tail(SEQ_LENGTH)
-    seq = np.zeros((1, SEQ_LENGTH, NUMBERS), dtype=np.float32)
+    seq = np.zeros((1, SEQ_LENGTH, INPUT_DIM), dtype=np.float32)
     for i, (_, row) in enumerate(recent.iterrows()):
         for col in ["n1","n2","n3","n4","n5","n6"]:
             seq[0, i, int(row[col]) - 1] = 1.0
+        # Day feature
+        seq[0, i, NUMBERS] = get_day_feature(str(row["date"]))
+
+    # Determine the day feature for the next (to be predicted) draw
+    next_day_feat = predict_next_draw_day(df)
+    # But we need to provide the full sequence including the day features for the last step.
+    # Our model predicts the next draw from the last SEQ_LENGTH steps; the input already contains day features for those steps.
+    # No extra day feature needed at prediction time.
 
     device = torch.device("cpu")
     checkpoint = torch.load(MODEL_PATH, map_location=device)
@@ -425,27 +487,33 @@ def predict_ensemble() -> tuple | None:
     if isinstance(checkpoint, dict) and "lstm" in checkpoint and "transformer" in checkpoint:
         lstm_model = LottoLSTM()
         lstm_model.load_state_dict(checkpoint["lstm"])
-        lstm_model.eval()
         tf_model = LottoTransformer()
         tf_model.load_state_dict(checkpoint["transformer"])
-        tf_model.eval()
-
-        with torch.no_grad():
-            main_l, add_l = lstm_model(torch.tensor(seq))
-            main_t, add_t = tf_model(torch.tensor(seq))
-            probs_main = (torch.sigmoid(main_l) + torch.sigmoid(main_t)) / 2.0
-            probs_add = (F.softmax(add_l, dim=1) + F.softmax(add_t, dim=1)) / 2.0
-            main_probs = probs_main.squeeze(0)
-            add_probs = probs_add.squeeze(0)
+        models = (lstm_model, tf_model)
     else:
-        # Fallback for single model
-        model = LottoLSTM()
-        model.load_state_dict(checkpoint, strict=False)
-        model.eval()
-        with torch.no_grad():
-            main_logits, add_logits = model(torch.tensor(seq))
-            main_probs = torch.sigmoid(main_logits).squeeze(0)
-            add_probs = F.softmax(add_logits, dim=1).squeeze(0)
+        # Fallback: single LSTM model
+        lstm_model = LottoLSTM()
+        lstm_model.load_state_dict(checkpoint, strict=False)
+        tf_model = None
+        models = (lstm_model,)
+
+    x = torch.tensor(seq, dtype=torch.float32)
+
+    if tf_model is not None:
+        # Ensemble with MC dropout
+        main_probs, add_probs = _ensemble_forward(models, x, mc_samples=MC_SAMPLES)
+    else:
+        # Single model with MC dropout
+        lstm_model.train()
+        main_sum = torch.zeros(NUMBERS)
+        add_sum = torch.zeros(NUMBERS)
+        for _ in range(MC_SAMPLES):
+            with torch.no_grad():
+                main_log, add_log = lstm_model(x)
+                main_sum += torch.sigmoid(main_log).squeeze(0).cpu()
+                add_sum += F.softmax(add_log, dim=1).squeeze(0).cpu()
+        main_probs = main_sum / MC_SAMPLES
+        add_probs = add_sum / MC_SAMPLES
 
     top6 = torch.topk(main_probs, 6).indices.tolist()
     add_probs_copy = add_probs.clone()
@@ -459,7 +527,7 @@ def predict_ensemble() -> tuple | None:
 
 
 # ============================================
-#  6. MAIN (CLI) – now with --patience
+#  6. MAIN (CLI)
 # ============================================
 if __name__ == "__main__":
     import argparse
